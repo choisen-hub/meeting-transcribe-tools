@@ -1,0 +1,110 @@
+#!/usr/bin/env osascript -l JavaScript
+// tile [cols|merge] — Terminal 탭·창을 화면에 균등 그리드 배치
+//   tile        탭을 전부 독립 창으로 떼어낸 뒤 자동 그리드 배치
+//   tile 2      2열 고정 배치
+//   tile merge  흩어진 창을 다시 탭 하나로 합치기
+ObjC.import('AppKit')
+
+function run(argv) {
+  const arg = (argv[0] || '').toLowerCase()
+  const term = Application('Terminal')
+  const se = Application('System Events')
+  const proc = se.processes['Terminal']
+
+  // 메뉴는 Terminal이 맨 앞 앱일 때만 활성화되므로 확실히 앞으로 가져온다
+  proc.frontmost = true
+  delay(0.4)
+
+  const menu = () => proc.menuBars[0].menuBarItems['Window'].menus[0].menuItems
+  const clickIfEnabled = (name) => {
+    const mi = menu()[name]
+    try { if (mi.enabled()) { mi.click(); return true } } catch (e) {}
+    return false
+  }
+
+  if (arg === 'merge') {
+    return clickIfEnabled('Merge All Windows')
+      ? '창들을 탭 하나로 합쳤습니다.' : '합칠 창이 없습니다.'
+  }
+
+  // 0) 탭 없는 유령 창 정리 (야간 자동 실행 잔재)
+  term.windows().filter(w => { try { return w.tabs().length === 0 } catch (e) { return false } })
+    .forEach(w => { try { w.close() } catch (e) {} })
+
+  // 1) 탭 그룹 해체: 각 창(=탭)을 앞으로 가져와 "Move Tab to New Window"
+  //    (탭이 하나뿐이면 메뉴가 비활성화라 자동으로 건너뜀)
+  const ids = term.windows().filter(w => w.visible() && !w.miniaturized()).map(w => w.id())
+  for (const id of ids) {
+    try { term.windows.byId(id).index = 1 } catch (e) { continue }
+    proc.frontmost = true
+    delay(0.3)
+    if (clickIfEnabled('Move Tab to New Window')) delay(0.4)
+  }
+
+  // 2) 다른 스페이스에 있는 창 모으기: 현재 스페이스(AX 목록)에 없는 창은
+  //    최소화→복원하면 지금 보고 있는 데스크톱으로 넘어온다
+  const axNames = () => { try { return new Set(proc.windows().map(w => w.name())) } catch (e) { return new Set() } }
+  let onSpace = axNames()
+  for (const w of term.windows().filter(w => w.visible() && !w.miniaturized())) {
+    if (onSpace.has(w.name())) continue
+    try { w.miniaturized = true; delay(0.5); w.miniaturized = false; delay(0.5) } catch (e) {}
+  }
+
+  const wins = term.windows().filter(w => w.visible() && !w.miniaturized())
+  const n = wins.length
+  if (n === 0) return '배치할 Terminal 창이 없습니다.'
+
+  const screens = $.NSScreen.screens
+  const primaryH = screens.objectAtIndex(0).frame.size.height
+  const b0 = wins[0].bounds()
+  const cx = b0.x + b0.width / 2
+  let target = screens.objectAtIndex(0)
+  for (let i = 0; i < screens.count; i++) {
+    const f = screens.objectAtIndex(i).frame
+    if (cx >= f.origin.x && cx < f.origin.x + f.size.width) { target = screens.objectAtIndex(i); break }
+  }
+  const vf = target.visibleFrame
+  const areaX = vf.origin.x
+  let areaY = primaryH - (vf.origin.y + vf.size.height) // Cocoa(좌하단) → 좌상단 기준 변환
+  let areaH = vf.size.height
+  const areaW = vf.size.width
+  // 보조 모니터는 visibleFrame이 메뉴바를 빼주지 않으므로 직접 보정
+  if (areaH === target.frame.size.height) {
+    const p = screens.objectAtIndex(0)
+    const menuH = p.frame.size.height - (p.visibleFrame.origin.y + p.visibleFrame.size.height)
+    areaY += menuH
+    areaH -= menuH
+  }
+
+  // 3) 균등 그리드 배치 — System Events는 좌상단 기준 좌표라 보조 모니터에서도 안 밀린다.
+  //    창 이름으로 AX 창을 찾아 위치·크기를 두 번 적용(1차에서 크기 조정, 2차에서 위치 고정)
+  const forcedCols = parseInt(arg, 10) || null
+  const cols = forcedCols || Math.ceil(Math.sqrt(n))
+  const rows = Math.ceil(n / cols)
+  const cellH = Math.floor(areaH / rows)
+
+  const cells = []
+  let i = 0
+  for (let r = 0; r < rows; r++) {
+    const inRow = Math.min(cols, n - r * cols) // 마지막 줄은 남은 창끼리 가로 균등
+    const cellW = Math.floor(areaW / inRow)
+    for (let c = 0; c < inRow; c++, i++) {
+      cells.push({ x: areaX + c * cellW, y: areaY + r * cellH, w: cellW, h: cellH })
+    }
+  }
+
+  for (let pass = 0; pass < 2; pass++) {
+    wins.forEach((w, j) => {
+      const cell = cells[j]
+      try {
+        const ax = proc.windows.byName(w.name())
+        ax.size = [cell.w, cell.h]
+        ax.position = [cell.x, cell.y]
+      } catch (e) {
+        w.bounds = { x: cell.x, y: cell.y, width: cell.w, height: cell.h }
+      }
+    })
+    delay(0.3)
+  }
+  return n + '개 창을 ' + rows + '×' + cols + ' 그리드로 배치했습니다.'
+}

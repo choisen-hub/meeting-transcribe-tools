@@ -1,0 +1,149 @@
+#!/bin/zsh
+# meet — Zoom(또는 모든 통화) 녹음 + 자동 전사 시스템
+#
+#   meet start [회의이름]   녹음 시작 (출력을 MeetRec 멀티출력으로 전환)
+#   meet stop              녹음 종료 → 원래 출력 복원 → Whisper 전사
+#   meet status            현재 상태 확인
+#
+# 원리: BlackHole(가상 오디오)과 현재 출력장치(이어폰)를 묶은 멀티출력
+# 장치를 즉석 생성해 시스템 출력으로 지정 → 상대방 소리가 이어폰과
+# BlackHole에 동시에 흐름. ffmpeg가 BlackHole(상대 음성) + 마이크(내
+# 음성)를 믹스해 녹음. stop 시 whisper.cpp(large-v3-turbo, 언어 자동
+# 감지)로 로컬 전사해 knowledge-hub/meetings/에 저장.
+
+set -u
+HELPER="$HOME/scripts/.bin/audio-multiout"
+STATE_DIR="$HOME/.local/state/meet"
+MEETINGS_DIR="$HOME/Desktop/knowledge-hub/meetings"
+MODEL="$HOME/.local/share/whisper/ggml-large-v3-turbo.bin"
+BH_UID="BlackHole2ch_UID"
+MULTI_UID="com.meet.multiout"
+
+mkdir -p "$STATE_DIR" "$MEETINGS_DIR"
+
+die() { print -u2 "❌ $1"; exit 1 }
+
+avf_index() {  # 장치 이름 → ffmpeg avfoundation 오디오 인덱스
+    ffmpeg -f avfoundation -list_devices true -i "" 2>&1 \
+      | sed -n '/audio devices/,$p' \
+      | grep -F "] $1" | head -1 | sed -E 's/.*\[([0-9]+)\].*/\1/'
+}
+
+cmd_start() {
+    local name="${1:-회의}"
+    [[ -f "$STATE_DIR/session" ]] && die "이미 녹음 중입니다. 먼저 'meet stop' 하세요."
+    [[ -x "$HELPER" ]] || die "헬퍼 없음: $HELPER (swiftc로 컴파일 필요)"
+
+    # BlackHole 확인
+    local bh_avf
+    bh_avf=$(avf_index "BlackHole 2ch")
+    [[ -n "$bh_avf" ]] || die "BlackHole이 없습니다. 설치: brew install --cask blackhole-2ch"
+
+    # 현재 기본 출력/입력 기억
+    local out_line in_line
+    out_line=$("$HELPER" default-output)
+    in_line=$("$HELPER" default-input)
+    local orig_out_uid="${out_line%%$'\t'*}" orig_out_name="${out_line#*$'\t'}"
+    local mic_name="${in_line#*$'\t'}"
+
+    [[ "$orig_out_uid" == "$MULTI_UID" ]] && die "출력이 이미 MeetRec입니다. 'meet stop'으로 정리 후 다시 시도하세요."
+
+    local mic_avf
+    mic_avf=$(avf_index "$mic_name")
+    [[ -n "$mic_avf" ]] || die "마이크($mic_name)의 ffmpeg 인덱스를 찾지 못했습니다."
+
+    # 멀티출력 장치 생성 후 기본 출력으로 전환
+    "$HELPER" destroy 2>/dev/null
+    "$HELPER" create "$orig_out_uid" "$BH_UID" >/dev/null || die "멀티출력 장치 생성 실패"
+    "$HELPER" set-default "$MULTI_UID" || { "$HELPER" destroy; die "출력 전환 실패" }
+
+    # 녹음 시작: BlackHole(상대) + 마이크(나) 믹스 → m4a
+    local ts dir
+    ts=$(date +%Y-%m-%d_%H%M)
+    dir="$MEETINGS_DIR/${ts}_${name// /_}"
+    mkdir -p "$dir"
+
+    nohup ffmpeg -hide_banner \
+        -f avfoundation -i ":${bh_avf}" \
+        -f avfoundation -i ":${mic_avf}" \
+        -filter_complex "[0:a]aformat=channel_layouts=mono[bh];[1:a]aformat=channel_layouts=mono[mc];[bh][mc]amix=inputs=2:duration=longest:dropout_transition=0[out]" \
+        -map "[out]" -ac 1 -ar 44100 -c:a aac -b:a 96k \
+        "$dir/recording.m4a" </dev/null >"$dir/.ffmpeg.log" 2>&1 &
+    local pid=$!
+
+    sleep 2
+    kill -0 $pid 2>/dev/null || { "$HELPER" set-default "$orig_out_uid"; "$HELPER" destroy
+        die "ffmpeg 시작 실패 — 로그: $dir/.ffmpeg.log (마이크 권한 승인 후 재시도)" }
+
+    print "pid=$pid\ndir=$dir\nname=$name\norig_out_uid=$orig_out_uid\norig_out_name=$orig_out_name" > "$STATE_DIR/session"
+    echo "🔴 녹음 시작: $name"
+    echo "   출력: $orig_out_name → MeetRec (이어폰으로 계속 들리고, 녹음도 됩니다)"
+    echo "   마이크: $mic_name"
+    echo "   저장: $dir"
+    echo "   종료: meet stop"
+}
+
+cmd_stop() {
+    [[ -f "$STATE_DIR/session" ]] || die "진행 중인 녹음이 없습니다."
+    local pid dir name orig_out_uid orig_out_name
+    while IFS='=' read -r k v; do typeset "$k=$v"; done < "$STATE_DIR/session"
+
+    # 녹음 종료 (SIGINT → 파일 마무리)
+    kill -INT "$pid" 2>/dev/null
+    local i=0
+    while kill -0 "$pid" 2>/dev/null && (( i++ < 20 )); do sleep 0.5; done
+    kill -9 "$pid" 2>/dev/null
+
+    # 오디오 원상복구
+    "$HELPER" set-default "$orig_out_uid" 2>/dev/null || print -u2 "⚠️  출력 복원 실패 — 시스템 설정>사운드에서 '$orig_out_name' 선택"
+    "$HELPER" destroy 2>/dev/null
+    rm -f "$STATE_DIR/session"
+    echo "⏹  녹음 종료 → 출력 복원: $orig_out_name"
+
+    [[ -s "$dir/recording.m4a" ]] || die "녹음 파일이 비어 있습니다: $dir"
+    local dur
+    dur=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$dir/recording.m4a" | cut -d. -f1)
+    echo "   길이: $((dur/60))분 $((dur%60))초"
+
+    # 전사
+    [[ -f "$MODEL" ]] || die "Whisper 모델 없음: $MODEL"
+    echo "📝 전사 중... (whisper large-v3-turbo, 언어 자동 감지)"
+    ffmpeg -v quiet -y -i "$dir/recording.m4a" -ar 16000 -ac 1 -c:a pcm_s16le "$dir/.tmp16k.wav"
+    whisper-cli -m "$MODEL" -f "$dir/.tmp16k.wav" -l auto -t 8 \
+        -otxt -osrt -of "$dir/transcript" >/dev/null 2>&1
+    rm -f "$dir/.tmp16k.wav"
+
+    [[ -s "$dir/transcript.txt" ]] || die "전사 실패 — 수동 재시도: whisper-cli -m $MODEL -f $dir/recording.m4a -l auto"
+
+    # 회의 노트 생성
+    {
+        echo "# $name"
+        echo ""
+        echo "- 일시: $(date '+%Y-%m-%d %H:%M') 종료"
+        echo "- 길이: $((dur/60))분 $((dur%60))초"
+        echo "- 녹음: recording.m4a / 타임스탬프: transcript.srt"
+        echo ""
+        echo "## 전사"
+        echo ""
+        cat "$dir/transcript.txt"
+    } > "$dir/note.md"
+
+    echo "✅ 완료: $dir/note.md"
+}
+
+cmd_status() {
+    if [[ -f "$STATE_DIR/session" ]]; then
+        cat "$STATE_DIR/session"
+        local pid=$(grep '^pid=' "$STATE_DIR/session" | cut -d= -f2)
+        kill -0 "$pid" 2>/dev/null && echo "상태: 🔴 녹음 중" || echo "상태: ⚠️ ffmpeg 죽음 — 'meet stop'으로 정리"
+    else
+        echo "상태: 대기 (녹음 없음)"
+    fi
+}
+
+case "${1:-}" in
+    start)  shift; cmd_start "$@" ;;
+    stop)   cmd_stop ;;
+    status) cmd_status ;;
+    *)      echo "사용법: meet start [회의이름] | meet stop | meet status"; exit 1 ;;
+esac
